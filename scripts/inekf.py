@@ -1,0 +1,225 @@
+#!/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+
+from nav_msgs.msg import Odometry
+from unitree_go.msg import LowState
+
+import numpy as np
+import math
+
+class Inekf(Node):
+
+    def __init__(self):
+        super().__init__('inekf')
+
+        self.vel_publisher_ = self.create_publisher(Odometry, 'odometry/feet_vel', 10)
+        self.pos_publisher_ = self.create_publisher(Odometry, 'odometry/feet_pos', 10)
+        self.subscription_ = self.create_subscription(LowState,
+                                                    '/lowstate',
+                                                    self.listener_callback,
+                                                    10)
+        # filter global variables
+        self.g_ = np.array(([0,0,-9.81])) # Gravity vector
+        
+        self.DT_MIN = 1e-6
+        self.DT_MAX = 1
+        self.dt = 0
+
+        # Init robot and filter state
+        self.R = np.identity(3) # TODO: verify the imu frame is in the same orientation as the state frame
+        self.v = np.zeros((3))
+        self.p = np.zeros((3))
+        self.bg = np.zeros((3)) # bg = Bias Gyroscope
+        self.ba = np.zeros((3)) # ba = Bias Accelerometer
+
+        #TODO implement noise
+        # Q = covariance matrix
+        self.Qg_ = np.array(([1e-6, 0, 0],
+                            [0, 1e-6, 0],
+                            [0, 0, 1e-6])) # gyro accuracy = 0.07 °/s
+        
+        self.Qa_ = np.array(([6e-2, 0, 0],
+                            [0, 6e-2, 0],
+                            [0, 0, 6e-2])) # acc accuracy = 25 mG
+        
+        # Biais - Constant offset on the value
+        #TODO: fill with real values for now using very small ones
+        self.Qbg_= np.identity((3)) * (1e-10*1e-10) # bias gyro
+        self.Qba_= np.identity((3)) * (1e-10*1e-10) # bias accel
+        # self.Ql_ = np.identity((3)) * (1e-10*1e-10) # bias landmarks
+        self.Qc_ = np.identity((3)) * (1e-10*1e-6) # bias contacts
+
+        # Data from go2
+        self.imu_measurement_ = np.zeros((6))
+        self.imu_measurement_prev_ = np.zeros((6))
+        self.feet_contacts_ = np.zeros((4)) 
+
+        # double = float in python
+        self.t : float = 0
+        self.t_prev : float = 0
+
+
+    def listener_callback(self, state_msg):
+        # Get timestamp # TODO
+        self.t = state_msg.tick * 0.001 #! convert from ms to s like it seems to be in OG code
+
+        # IMU measurement - used for propagation
+        self.imu_measurement_[0] = state_msg.imu_state.gyroscope[0]
+        self.imu_measurement_[1] = state_msg.imu_state.gyroscope[1]
+        self.imu_measurement_[2] = state_msg.imu_state.gyroscope[2]
+
+        self.imu_measurement_[3] = state_msg.imu_state.accelerometer[0]
+        self.imu_measurement_[4] = state_msg.imu_state.accelerometer[1]
+        self.imu_measurement_[5] = state_msg.imu_state.accelerometer[2]
+
+        if(self.dt > self.DT_MIN and self.dt < self.DT_MAX):
+            #propagate using previous measurement
+            # m = prev_meas
+            
+            #Eigen::Vector3d w = m.head(3) - state_.getGyroscopeBias();
+            # Angular Velocity
+            w =  self.imu_measurement_prev_[:3] - self.bg # first three values of imu (gyro) - gyroscope bias
+            
+            # Eigen::Vector3d a = m.tail(3) - state_.getAccelerometerBias(); 
+            # Linear Acceleration
+            a = self.imu_measurement_prev_[3:] - self.ba # first three values of imu (accel) - accel bias
+            
+
+            #! Eigen::MatrixXd X = state_.getX();
+            #! Eigen::MatrixXd P = state_.getP();
+
+            # Extract State self.R self.v self.p
+            # Eigen::Matrix3d R = state_.getRotation();
+            # Eigen::Vector3d v = state_.getVelocity();
+            # Eigen::Vector3d p = state_.getPosition();
+
+            # Strapdown IMU motion model
+            phi = w*self.dt # vecteur (1,3)
+            R_pred = self.R * self.Exp_SO3(phi) # vecteur (1,3)
+            v_pred = self.v + (self.R*a + self.g_)*self.dt # vecteur (1,3)
+            p_pred = self.p + self.v*self.dt + 0.5*(self.R*a + self.g_)*self.dt*self.dt; # vecteur (1,3)
+
+            # Set new state (bias has constant dynamics)
+            # state_.setRotation(R_pred);
+            # state_.setVelocity(v_pred);
+            # state_.setPosition(p_pred);
+            self.R = R_pred
+            self.v = v_pred
+            self.p = p_pred
+
+           
+
+            # # ---- Linearized invariant error dynamics -----
+            # int dimX = state_.dimX();
+            # int dimP = state_.dimP();
+            # int dimTheta = state_.dimTheta();
+            # Eigen::MatrixXd A = Eigen::MatrixXd::Zero(dimP,dimP);
+            # # Inertial terms
+            # A.block<3,3>(3,0) = skew(g_); # TODO: Efficiency could be improved by not computing the constant terms every time
+            # A.block<3,3>(6,3) = Eigen::Matrix3d::Identity();
+            # # Bias terms
+            # A.block<3,3>(0,dimP-dimTheta) = -R;
+            # A.block<3,3>(3,dimP-dimTheta+3) = -R;
+            # for (int i=3; i<dimX; ++i) {
+            #     A.block<3,3>(3*i-6,dimP-dimTheta) = -skew(X.block<3,1>(0,i))*R;
+            # } 
+
+            # # Noise terms
+            # Eigen::MatrixXd Qk = Eigen::MatrixXd::Zero(dimP,dimP); # Landmark noise terms will remain zero
+            # Qk.block<3,3>(0,0) = noise_params_.getGyroscopeCov(); 
+            # Qk.block<3,3>(3,3) = noise_params_.getAccelerometerCov();
+            # for(map<int,int>::iterator it=estimated_contact_positions_.begin(); it!=estimated_contact_positions_.end(); ++it) {
+            #     Qk.block<3,3>(3+3*(it->second-3),3+3*(it->second-3)) = noise_params_.getContactCov(); # Contact noise terms
+            # }
+            # Qk.block<3,3>(dimP-dimTheta,dimP-dimTheta) = noise_params_.getGyroscopeBiasCov();
+            # Qk.block<3,3>(dimP-dimTheta+3,dimP-dimTheta+3) = noise_params_.getAccelerometerBiasCov();
+
+            # # Discretization
+            # Eigen::MatrixXd I = Eigen::MatrixXd::Identity(dimP,dimP);
+            # Eigen::MatrixXd Phi = I + A*dt; # Fast approximation of exp(A*dt). TODO: explore using the full exp() instead
+            # Eigen::MatrixXd Adj = I;
+            # Adj.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(X); # Approx 200 microseconds
+            # Eigen::MatrixXd PhiAdj = Phi * Adj;
+            # Eigen::MatrixXd Qk_hat = PhiAdj * Qk * PhiAdj.transpose() * dt; # Approximated discretized noise matrix (faster by 400 microseconds)
+
+            # # Propagate Covariance
+
+            # Eigen::MatrixXd P_pred = Phi * P * Phi.transpose() + Qk_hat;
+
+            # # Set new covariance
+            # state_.setP(P_pred);
+
+#!-----------------------END OF COPY PASTE---------------
+
+
+
+
+        # CONTACT data : order changed to match URDF #? not sure if needed
+        self.feet_contacts_[0] = 1
+        self.feet_contacts_[1] = 0
+        self.feet_contacts_[2] = 3
+        self.feet_contacts_[3] = 2
+
+        contacts = np.array((0,0))
+
+        # KINEMATIC data
+        quaternion = np.zeros((4))
+        quaternion[0] = state_msg.imu_state.quaternion[0]
+        quaternion[1] = state_msg.imu_state.quaternion[1]
+        quaternion[2] = state_msg.imu_state.quaternion[2]
+        quaternion[3] = state_msg.imu_state.quaternion[3]
+        # TODO normalize quaternion && find quat type
+
+
+
+
+        # TODO: add feet vel and feet pos (additionnal info on base)
+        self.dt = self.t - self.t_prev
+        # print("dt:", dt)
+        self.t_prev = self.t
+        self.imu_measurement_prev_ = self.imu_measurement_
+
+    def Exp_SO3(self,w):
+        # Computes the vectorized exponential map for SO(3)
+        TOLERANCE = 1e-10
+        A = self.skew(w)
+
+        theta = np.linalg.norm(w)
+        
+        if(theta < TOLERANCE):
+            return np.identity(3)
+        
+        R = np.identity(3) + (math.sin(theta)/theta)*A + ((1-math.cos(theta))/(theta*theta))*A*A
+
+        return R
+    
+
+    def skew(self,vector):
+        # convert vector to skew-symmetric matrix
+        M = np.zeros((3,3))
+        M = np.array([[0,-vector[2],vector[1]],
+             [vector[2],0,-vector[0]],
+             [-vector[1],vector[0],0]])
+        return M
+
+
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    inekf = Inekf()
+
+    rclpy.spin(inekf)
+
+    # Destroy the node explicitly
+    # (optional - otherwise it will be done automatically
+    # when the garbage collector destroys the node object)
+    inekf.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
