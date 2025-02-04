@@ -28,21 +28,21 @@ class Inekf(Node):
                                                     10)
         
         # Filter and global variables ==========================================
-        self.g_ = np.array(([0,0,-9.81])) # Gravity vector
+        self.g_ = np.array(([0],[0],[-9.81])) # Gravity vector
         
         self.DT_MIN = 1e-6
         self.DT_MAX = 1
         self.dt = 0
 
-        # Init Robot and Filter state ==========================================
+        # Init Robot state =====================================================
         # initiated by constructor in OG class
-        state_ = RobotState()
-
+        self.state_ = RobotState()
+    
         R0 = np.identity(3) # TODO: verify the imu frame is in the same orientation as the state frame
-        v0 = np.zeros((3))
-        p0 = np.zeros((3))
-        bg0 = np.zeros((3)) # bg = Bias Gyroscope
-        ba0 = np.zeros((3)) # ba = Bias Accelerometer
+        v0 = np.zeros((3,1))
+        p0 = np.zeros((3,1))
+        bg0 = np.zeros((3,1)) # bg = Bias Gyroscope
+        ba0 = np.zeros((3,1)) # ba = Bias Accelerometer
 
         self.state_.setRotation(R0);
         self.state_.setVelocity(v0);
@@ -50,26 +50,18 @@ class Inekf(Node):
         self.state_.setGyroscopeBias(bg0);
         self.state_.setAccelerometerBias(ba0);
 
-        #TODO implement noise
+        # Init state noise =====================================================
         # Q = covariance matrix
-        self.Qg_ = np.array(([1e-6, 0, 0],
-                            [0, 1e-6, 0],
-                            [0, 0, 1e-6])) # gyro accuracy = 0.07 °/s
-        
-        self.Qa_ = np.array(([6e-2, 0, 0],
-                            [0, 6e-2, 0],
-                            [0, 0, 6e-2])) # acc accuracy = 25 mG
-        
-        # Biais - Constant offset on the value
-        #TODO: fill with real values for now using very small ones
-        self.Qbg_= np.identity((3)) * (1e-10*1e-10) # bias gyro
-        self.Qba_= np.identity((3)) * (1e-10*1e-10) # bias accel
-        # self.Ql_ = np.identity((3)) * (1e-10*1e-10) # bias landmarks
-        self.Qc_ = np.identity((3)) * (1e-10*1e-6) # bias contacts
+        self.noise_params = NoiseParam()
+        self.noise_params.setGyroscopeNoise(math.sqrt(1e-6)) # sqrt(1e-6)
+        self.noise_params.setAccelerometerNoise(math.sqrt(6e-2));
+        self.noise_params.setGyroscopeBiasNoise(1e-10);
+        self.noise_params.setAccelerometerBiasNoise(1e-10);
+        self.noise_params.setContactNoise(1e-10);
 
         # Data from go2 ========================================================
-        self.imu_measurement_ = np.zeros((6))
-        self.imu_measurement_prev_ = np.zeros((6))
+        self.imu_measurement_ = np.zeros((6,1))
+        self.imu_measurement_prev_ = np.zeros((6,1))
         self.feet_contacts_ = np.zeros((4)) 
 
         # double = float in python
@@ -78,29 +70,27 @@ class Inekf(Node):
 
 
     def listener_callback(self, state_msg):
-        # TODO Get timestamp 
+        # TODO verify if timestamp can be used as time
         self.t = state_msg.tick * 0.001 # convert from ms to s like it seems to be in OG code
 
         # IMU measurement - used for propagation ===============================
-        self.imu_measurement_[0] = state_msg.imu_state.gyroscope[0]
-        self.imu_measurement_[1] = state_msg.imu_state.gyroscope[1]
-        self.imu_measurement_[2] = state_msg.imu_state.gyroscope[2]
+        self.imu_measurement_[0][0] = state_msg.imu_state.gyroscope[0]
+        self.imu_measurement_[1][0] = state_msg.imu_state.gyroscope[1]
+        self.imu_measurement_[2][0] = state_msg.imu_state.gyroscope[2]
 
-        self.imu_measurement_[3] = state_msg.imu_state.accelerometer[0]
-        self.imu_measurement_[4] = state_msg.imu_state.accelerometer[1]
-        self.imu_measurement_[5] = state_msg.imu_state.accelerometer[2]
+        self.imu_measurement_[3][0] = state_msg.imu_state.accelerometer[0]
+        self.imu_measurement_[4][0] = state_msg.imu_state.accelerometer[1]
+        self.imu_measurement_[5][0] = state_msg.imu_state.accelerometer[2]
+
 
         if(self.dt > self.DT_MIN and self.dt < self.DT_MAX):
             #propagate using previous measurement
-            # m = prev_meas
             
-            #Eigen::Vector3d w = m.head(3) - state_.getGyroscopeBias();
             # Angular Velocity
-            w =  self.imu_measurement_prev_[:3] - self.bg # first three values of imu (gyro) - gyroscope bias
-            
-            # Eigen::Vector3d a = m.tail(3) - state_.getAccelerometerBias(); 
+            w =  self.imu_measurement_prev_[:3] - self.state_.getGyroscopeBias() # first three values of imu (gyro) - gyroscope bias
+
             # Linear Acceleration
-            a = self.imu_measurement_prev_[3:] - self.ba # first three values of imu (accel) - accel bias
+            a = self.imu_measurement_prev_[3:] - self.state_.getAccelerometerBias() # first three values of imu (accel) - accel bias
             
 
             X = self.state_.getX();
@@ -112,15 +102,19 @@ class Inekf(Node):
             p = self.state_.getPosition();
 
             # Strapdown IMU motion model
-            phi = w*self.dt # vecteur (1,3)
-            R_pred = self.R * self.Exp_SO3(phi) # vecteur (1,3)
-            v_pred = self.v + (self.R*a + self.g_)*self.dt # vecteur (1,3)
-            p_pred = self.p + self.v*self.dt + 0.5*(self.R*a + self.g_)*self.dt*self.dt; # vecteur (1,3)
+            phi = w*self.dt # vecteur (3,1)
+
+            R_pred = np.matmul(R,self.Exp_SO3(phi)) # vecteur (3,3)
+
+            v_pred = v + (np.matmul(R,a) + self.g_)*self.dt # vecteur (3,1)
+            p_pred = p + v*self.dt + 0.5*(np.matmul(R,a) + self.g_)*self.dt*self.dt; # vecteur (3,1)
 
             # Set new state (bias has constant dynamics)
             self.state_.setRotation(R_pred);
             self.state_.setVelocity(v_pred);
             self.state_.setPosition(p_pred);
+
+            self.state_.print()
             
 
            
@@ -193,7 +187,6 @@ class Inekf(Node):
 
         # TODO: add feet vel and feet pos (additionnal info on base)
         self.dt = self.t - self.t_prev
-        # print("dt:", dt)
         self.t_prev = self.t
         self.imu_measurement_prev_ = self.imu_measurement_
 
@@ -211,11 +204,11 @@ class Inekf(Node):
     
 
     def skew(self,vector):
-        # convert vector to skew-symmetric matrix
+        # convert vector (column) to skew-symmetric matrix
         M = np.zeros((3,3))
-        M = np.array([[0,-vector[2],vector[1]],
-                    [vector[2],0,-vector[0]],
-                    [-vector[1],vector[0],0]])
+        M = np.array([[0,         -vector[2][0],vector[1][0]],
+                    [vector[2][0], 0           ,-vector[0][0]],
+                    [-vector[1][0],vector[0][0],   0]])
         return M
 
 
@@ -281,16 +274,16 @@ class RobotState():
     def dimP(self):
         return self.__P.shape[1]
         
-    def getGyroscopeBiais(self):
+    def getGyroscopeBias(self):
         return self.__Theta[0:3,0:1]
 
-    def setGyroscopeBiais(self,bg):
+    def setGyroscopeBias(self,bg):
         self.__Theta[0:3,0:1] = bg
 
-    def getAccelerometerBiais(self):
+    def getAccelerometerBias(self):
         return self.__Theta[3:6,0:1]
 
-    def setAccelerometerBiais(self,ba):
+    def setAccelerometerBias(self,ba):
         self.__Theta[3:6,0:1] = ba
 
     def copyDiag(self, n, BigX):
@@ -302,13 +295,20 @@ class RobotState():
             startIndex = BigX.shape[0]
             
             new_BigX = np.zeros((startIndex + dimX, startIndex + dimX))
-            new_BigX[:BigX.shape[0], :BigX.shape[1]] = BigX
+            new_BigX[ : BigX.shape[0], : BigX.shape[1]] = BigX
            
             new_BigX[ startIndex : startIndex+dimX , startIndex : startIndex+dimX] = self.__X
 
             BigX=new_BigX
 
         return BigX
+    def print(self):
+        np.set_printoptions(precision=2)
+        print("--------- Robot State -------------")
+        print("X:\n",self.__X)
+        print("Theta:\n",self.__Theta)
+        print("P:",self.__P)
+        print("-----------------------------------")
 
 
 # ==============================================================================
@@ -323,13 +323,12 @@ class NoiseParam():
         self.__Qba = np.array((3,3))
         self.__Ql  = np.array((3,3))
         self.__Qc  = np.array((3,3))
-        
 
         self.setGyroscopeNoise(0.01)
         self.setAccelerometerNoise(0.1)
         self.setGyroscopeBiasNoise(0.00001)
         self.setAccelerometerBiasNoise(0.0001)
-        self.setLandmarkNoise(0.1)
+        # self.setLandmarkNoise(0.1) #* not implemented
         self.setContactNoise(0.1)
         
 
@@ -350,13 +349,13 @@ class NoiseParam():
     def setGyroscopeBiasNoise(self,value):
         self.__Qbg = np.identity(3)*value*value
 
-    def getGyroscopeBiaisCov(self):
+    def getGyroscopeBiasCov(self):
         return self.__Qbg
     
     def setAccelerometerBiasNoise(self,value):
         self.__Qba = np.identity(3)*value*value
 
-    def getAccelerometerBiaisCov(self):
+    def getAccelerometerBiasCov(self):
         return self.__Qba
 
     def setContactNoise(self,value):
@@ -365,7 +364,7 @@ class NoiseParam():
     def getContactCov(self):
         return self.__Qc
 
-    #NOTE void setLandmarkNoise(double std) and  Eigen::Matrix3d getContactCov() not implemented beacause not used
+    #* void setLandmarkNoise(double std) and  Eigen::Matrix3d getContactCov() not implemented beacause not used
     
 
 
