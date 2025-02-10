@@ -22,7 +22,9 @@ find_package(geometry_msgs)
 # )
 
 # Install Python executables
-file(GLOB SCRIPTS_LIST scripts/*.py)
+file(GLOB SCRIPTS_LIST 
+    scripts/calc_bias_imu.py
+    scripts/*.py)
 
 install(PROGRAMS
   ${SCRIPTS_LIST}
