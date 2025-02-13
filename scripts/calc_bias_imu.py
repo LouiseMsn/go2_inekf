@@ -28,6 +28,7 @@ class Bias_calc(Node):
         self.nb_samples  = 0
         self.res_acc = np.zeros((3,1))
         self.res_gyro = np.zeros((3,1))
+        self.res_norm = 0
         
 
     
@@ -50,10 +51,15 @@ class Bias_calc(Node):
         self.res_gyro[1] = self.res_gyro[1]*((self.nb_samples-1)/self.nb_samples) + state_msg.imu_state.gyroscope[1]/self.nb_samples
         self.res_gyro[2] = self.res_gyro[2]*((self.nb_samples-1)/self.nb_samples) + state_msg.imu_state.gyroscope[2]/self.nb_samples
 
+        # Norm on all 3 axis ===================================================
+        norm = math.sqrt( state_msg.imu_state.accelerometer[0]*state_msg.imu_state.accelerometer[0] + state_msg.imu_state.accelerometer[1]*state_msg.imu_state.accelerometer[1] + state_msg.imu_state.accelerometer[2]*state_msg.imu_state.accelerometer[2] )
+        self.res_norm = self.res_norm*((self.nb_samples-1)/self.nb_samples) + norm/self.nb_samples
 
         print("Number of samples :", self.nb_samples)
-        print("Accelerometer biais :\n", self.res_acc)
-        print("Gyroscope bias :\n", self.res_gyro)
+        # print("Accelerometer biais :\n", self.res_acc)
+        # print("Gyroscope bias :\n", self.res_gyro)
+        print("Instantaneous accel norm : \n", norm)
+        print("Mean of norm : \n", self.res_norm)
         print("-----------------------------------------")
 
 
